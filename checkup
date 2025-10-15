@@ -745,6 +745,92 @@ generate_report_json() {
 }
 
 #######################################
+# Aggregate idx_scan values across all hosts for H002
+# Globals:
+#   JSON_REPORTS_DIR, PROJECT_DIR
+# Arguments:
+#   None
+# Returns:
+#   None
+#######################################
+aggregate_h002_across_hosts() {
+  local h002_json="${JSON_REPORTS_DIR}/H002_unused_indexes.json"
+  
+  [[ -f "$h002_json" ]] || return 0
+  
+  msg "Aggregating H002 unused indexes across all cluster hosts..."
+  
+  local temp_json=$(mktemp "${JSON_REPORTS_DIR}/H002_temp_XXXXXX.json")
+  
+  # Keep only indexes that appear in ALL hosts' never_used_indexes
+  jq '
+    # Get list of hosts
+    (.results | keys) as $all_hosts |
+    
+    # For each host, get their never_used_indexes keys (or empty array if null)
+    [
+      $all_hosts[] as $host |
+      .results[$host].data.never_used_indexes | 
+      if . == null then [] else keys end
+    ] as $all_never_used_lists |
+    
+    # Find intersection: indexes that appear in ALL hosts
+    (
+      $all_never_used_lists[0] | 
+      map(select(. as $idx | 
+        ($all_never_used_lists | all(index($idx) != null))
+      ))
+    ) as $truly_unused_list |
+    
+    # Filter each host data
+    .results = (
+      .results | to_entries | map(
+        # Filter never_used_indexes
+        if (.value.data.never_used_indexes != null) then
+          .value.data.never_used_indexes = (
+            .value.data.never_used_indexes | 
+            with_entries(select(.key as $idx | $truly_unused_list | index($idx) != null))
+          )
+        else . end |
+        
+        # Filter "do" array (DROP commands)
+        if (.value.data.do != null) then
+          .value.data.do = (
+            .value.data.do | 
+            map(select(. as $cmd | 
+              $truly_unused_list | 
+              any(. as $idx | $cmd | contains($idx))
+            ))
+          )
+        else . end |
+        
+        # Filter "undo" array (CREATE commands)
+        if (.value.data.undo != null) then
+          .value.data.undo = (
+            .value.data.undo | 
+            map(select(. as $cmd | 
+              $truly_unused_list | 
+              any(. as $idx | $cmd | contains($idx))
+            ))
+          )
+        else . end |
+        
+        {key: .key, value: .value}
+      ) | from_entries
+    )
+  ' "$h002_json" > "$temp_json"
+  
+  if [[ $? -eq 0 ]]; then
+    mv "$temp_json" "$h002_json"
+    msg "H002 aggregation complete - kept only indexes unused on ALL hosts"
+  else
+    msg "ERROR: H002 aggregation failed"
+    rm -f "$temp_json"
+    return 1
+  fi
+}
+
+#######################################
 # Check is host in recovery mode or not
 #
 # Do not use this function before 'host_pre_start_checks()'
@@ -1336,6 +1422,9 @@ run_process() {
   MD_REPORTS_DIR="${PROJECT_DIR}/md_reports/${timestamp_dir}"
 
   mkdir -p "${MD_REPORTS_DIR}"
+
+  # ADD THIS LINE HERE:
+  aggregate_h002_across_hosts
 
   for json_file in `ls ${JSON_REPORTS_DIR}/*.json`; do
     check_id=$(cat ${json_file} | jq -r '.checkId')
